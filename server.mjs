@@ -5,36 +5,45 @@ import { google } from 'googleapis';
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// ---------- ENV ----------
+/* =======================
+   ENV
+   ======================= */
 const SECRET       = process.env.WEBHOOK_SECRET || 'change-me';
 const BB_USERNAME  = process.env.BB_USERNAME;
 const BB_PASSWORD  = process.env.BB_PASSWORD;
+
+// Point this to YOUR assignments tab URL/hash
 const BASE         = process.env.BB_BASE || 'https://<your-subdomain>.myschoolapp.com/';
 const LOGIN_URL    = process.env.BB_LOGIN_URL || BASE + 'app/login';
 const ASSIGN_URL   = process.env.BB_ASSIGN_URL || BASE + 'app/student#assignment-center';
 
-// DOM selectors (override via Render env if needed)
-const CARD_SEL     = process.env.CARD_SELECTOR       || '.assignment-card';
-const TITLE_SEL    = process.env.TITLE_SELECTOR      || '.assignment-title';
-const COURSE_SEL   = process.env.COURSE_SELECTOR     || '.assignment-course';
-const DUE_SEL      = process.env.DUE_SELECTOR        || '.assignment-due';
-const DESC_SEL     = process.env.DESC_SELECTOR       || '.assignment-description';
-const RES_LINK_SEL = process.env.RES_LINK_SELECTOR   || 'a.resource-link';
+/* If your school’s DOM classes are different, override via env: */
+const LIST_LINK_SEL   = process.env.LIST_LINK_SELECTOR   || 'a[href*="Assignment"], a[href*="assignment"]';
+const DETAIL_TITLE    = process.env.DETAIL_TITLE_SELECTOR|| 'h1, .assignment-title, .detail-title';
+const DETAIL_COURSE   = process.env.DETAIL_COURSE_SELECTOR|| '.assignment-course, .detail-course';
+const DETAIL_DUE      = process.env.DETAIL_DUE_SELECTOR  || '.assignment-due, .detail-due';
+const DETAIL_DESC     = process.env.DETAIL_DESC_SELECTOR || '.assignment-description, .detail-description';
+const DETAIL_RES_AREA = process.env.DETAIL_RES_AREA_SEL  || '.assignment-resources, .detail-resources';
+const DETAIL_RES_ANCH = process.env.DETAIL_RES_ANCH_SEL  || `${DETAIL_RES_AREA} a, a.resource-link`;
 
-// Google Drive (service account JSON pasted into env)
-const SA_JSON      = process.env.GOOGLE_SERVICE_ACCOUNT_JSON; // full JSON
+/* Google Drive (optional but recommended for attachments) */
+const SA_JSON      = process.env.GOOGLE_SERVICE_ACCOUNT_JSON; // paste full JSON in Render env
 const DRIVE_FOLDER = process.env.GDRIVE_FOLDER_ID || null;
 
-function driveClient() {
-  if (!SA_JSON) return null;
-  const creds = JSON.parse(SA_JSON);
-  const jwt = new google.auth.JWT(
-    creds.client_email,
-    null,
-    creds.private_key,
-    ['https://www.googleapis.com/auth/drive']
-  );
-  return google.drive({ version: 'v3', auth: jwt });
+function driveClientOrNull() {
+  try {
+    if (!SA_JSON) return null;
+    const creds = JSON.parse(SA_JSON);
+    const jwt = new google.auth.JWT(
+      creds.client_email,
+      null,
+      creds.private_key,
+      ['https://www.googleapis.com/auth/drive']
+    );
+    return google.drive({ version: 'v3', auth: jwt });
+  } catch {
+    return null;
+  }
 }
 
 async function driveUploadBuffer(drive, name, buffer, mimeType = 'application/octet-stream') {
@@ -48,6 +57,9 @@ async function driveUploadBuffer(drive, name, buffer, mimeType = 'application/oc
   return { id: fileId, href: data.webViewLink || data.webContentLink, mimeType: data.mimeType, name: data.name };
 }
 
+/* =======================
+   SCRAPE ENDPOINT
+   ======================= */
 app.post('/scrape', async (req, res) => {
   try {
     if (req.header('X-Webhook-Secret') !== SECRET) {
@@ -61,75 +73,90 @@ app.post('/scrape', async (req, res) => {
     // ----- LOGIN -----
     await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
 
-    // Typical Blackbaud username/password form
+    // Typical username/password flow
     if (await page.locator('input[name="username"]').count()) {
       await page.fill('input[name="username"]', BB_USERNAME);
       await page.fill('input[name="password"]', BB_PASSWORD);
       await page.click('button[type="submit"]');
       await page.waitForLoadState('networkidle');
     } else {
-      // SSO button (adjust if your portal shows different text)
+      // SSO button (adjust if your portal shows a different label)
       const ssoBtn = page.locator('text=Sign in with SSO');
       if (await ssoBtn.count()) {
         await ssoBtn.click();
-        // If your school has extra SSO steps/MFA, this may need tweaks.
         await page.waitForLoadState('networkidle');
+        // If MFA prompts, you may need to extend this once you see the page
       }
     }
 
-    // ----- ASSIGNMENTS -----
+    // ----- ASSIGNMENT LIST (tab) -----
     await page.goto(ASSIGN_URL, { waitUntil: 'networkidle' });
-    // Give the SPA a moment to render
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1500); // give SPA time to render
 
-    const cards = page.locator(CARD_SEL);
-    const count = await cards.count();
+    // Grab ALL assignment links in the list
+    const listLinks = page.locator(LIST_LINK_SEL);
+    const listCount = await listLinks.count();
 
-    const drive = driveClient();
+    const drive = driveClientOrNull();
     const assignments = [];
 
-    for (let i = 0; i < count; i++) {
-      const card = cards.nth(i);
+    for (let i = 0; i < listCount; i++) {
+      const link = listLinks.nth(i);
 
-      const textOrEmpty = async (sel) =>
-        ((await card.locator(sel).first().textContent().catch(()=>'') ) || '').trim();
+      // Open each assignment in a NEW TAB so we don't lose the list
+      const [detailPage] = await Promise.all([
+        context.waitForEvent('page'),
+        link.click()
+      ]);
 
-      const title = await textOrEmpty(TITLE_SEL);
-      const course = await textOrEmpty(COURSE_SEL);
-      const due = await textOrEmpty(DUE_SEL);
-      const description = await textOrEmpty(DESC_SEL);
+      await detailPage.waitForLoadState('networkidle');
+      await detailPage.waitForTimeout(800);
 
-      // --- Resources: click and upload to Drive if file download happens ---
-      const anchors = card.locator(RES_LINK_SEL);
-      const n = await anchors.count();
+      // ---- scrape detail fields ----
+      const getText = async (sel) =>
+        ((await detailPage.locator(sel).first().textContent().catch(() => '')) || '').trim();
+
+      const title       = await getText(DETAIL_TITLE);
+      const course      = await getText(DETAIL_COURSE);
+      const due         = await getText(DETAIL_DUE);
+      const description = await getText(DETAIL_DESC);
+
+      // ---- resources / attachments ----
+      const resAnchors = detailPage.locator(DETAIL_RES_ANCH);
+      const rCount = await resAnchors.count();
       const resources = [];
 
-      for (let j = 0; j < n; j++) {
-        const a = anchors.nth(j);
-        const name = ((await a.textContent().catch(()=>'')) || 'resource').trim();
+      for (let r = 0; r < rCount; r++) {
+        const a = resAnchors.nth(r);
+        const name = ((await a.textContent().catch(() => '')) || 'resource').trim();
 
+        // Try to click and capture a download
         const [dl] = await Promise.all([
-          page.waitForEvent('download').catch(()=>null),
+          detailPage.waitForEvent('download').catch(() => null),
           a.click()
         ]);
 
         if (dl && drive) {
-          const suggested = await dl.suggestedFilename().catch(()=> name);
-          const buffer = await dl.createReadStream().then(rs => new Promise((resolve,reject)=>{
-            const chunks=[]; rs.on('data',d=>chunks.push(d));
-            rs.on('end',()=>resolve(Buffer.concat(chunks)));
-            rs.on('error',reject);
+          // Upload downloaded file to Drive to get a public link
+          const suggested = await dl.suggestedFilename().catch(() => name);
+          const buffer = await dl.createReadStream().then(rs => new Promise((resolve, reject) => {
+            const chunks = [];
+            rs.on('data', d => chunks.push(d));
+            rs.on('end', () => resolve(Buffer.concat(chunks)));
+            rs.on('error', reject);
           }));
-          const up = await driveUploadBuffer(drive, suggested, buffer);
-          resources.push({ name: up.name, href: up.href, mimeType: up.mimeType });
+          const uploaded = await driveUploadBuffer(drive, suggested, buffer);
+          resources.push({ name: uploaded.name, href: uploaded.href, mimeType: uploaded.mimeType });
         } else {
-          // Not a direct file (or Drive not configured): just capture href
+          // If it wasn't a file download (or Drive not configured), keep the href
           const href = await a.getAttribute('href');
           resources.push({ name, href, mimeType: 'text/html' });
         }
       }
 
       assignments.push({ title, course, due, description, resources });
+
+      await detailPage.close();
     }
 
     await browser.close();
@@ -140,5 +167,6 @@ app.post('/scrape', async (req, res) => {
   }
 });
 
+/* healthcheck */
 app.get('/', (_, res) => res.send('OK'));
 app.listen(process.env.PORT || 3000, () => console.log('listening'));
