@@ -2,6 +2,7 @@
   "name": "bb-scraper",
   "private": true,
   "type": "module",
+  "engines": { "node": "20.x" },
   "scripts": {
     "postinstall": "npx playwright install --with-deps chromium",
     "start": "node server.mjs"
@@ -12,4 +13,3 @@
     "googleapis": "^133.0.0"
   }
 }
-
