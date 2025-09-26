@@ -2,10 +2,14 @@
   "name": "bb-scraper",
   "private": true,
   "type": "module",
-  "scripts": { "start": "node server.mjs" },
+  "scripts": {
+    "postinstall": "npx playwright install --with-deps chromium",
+    "start": "node server.mjs"
+  },
   "dependencies": {
     "express": "^4.19.2",
     "playwright": "^1.47.2",
     "googleapis": "^133.0.0"
   }
 }
+
