@@ -1,8 +1,5 @@
-// server.mjs — Blackbaud Assignments Scraper (n8n-friendly)
-// - Auth via BBID and/or Microsoft (handles KMSI + #login bounce)
-// - Navigates to Assignment Center (forces List view)
-// - Scrapes each assignment's detail page (title, course, due, description)
-// - Collects resources (links, downloads) with optional Google Drive upload
+// server.mjs — Blackbaud Assignments Scraper (handles SPA #login + BBID + Microsoft)
+// n8n-friendly HTTP endpoint with X-Webhook-Secret
 
 import express from "express";
 import { chromium } from "playwright";
@@ -14,10 +11,10 @@ const BB_BASE      = (process.env.BB_BASE || "").replace(/\/+$/, "");
 const BB_USERNAME  = process.env.BB_USERNAME || "";
 const BB_PASSWORD  = process.env.BB_PASSWORD || "";
 
-// You can override any of these selectors from Render → Environment
+// Selectors (override via env if needed)
 const LINK_CONTAINER_SELECTOR =
   process.env.LINK_CONTAINER_SELECTOR ||
-  "main, [role='main'], #content, .assignment-center, .lms-assignment, .fsAssignmentCenter, .fsCalendar, .bb-calendar";
+  "main, [role='main'], #content, .assignment-center, .fsAssignmentCenter, .bb-calendar";
 
 const LIST_LINK_SELECTOR =
   process.env.LIST_LINK_SELECTOR ||
@@ -39,20 +36,24 @@ const DETAIL_DESC_SELECTOR =
   process.env.DETAIL_DESC_SELECTOR ||
   "[class*='description'], [id*='description'], [data-automation-id*='description']";
 
-// Keep resource selector simple & robust (no :text or complex :has)
+// Simplified resource targets (avoid :has/:text to keep compatibility)
 const DETAIL_RES_ANCH_SEL =
   process.env.DETAIL_RES_ANCH_SEL ||
   "a[download], a[href*='/download/'], a[href^='http']:not([href^='mailto:'])";
 
 const ASSIGN_FORCE_LIST_BUTTON =
   process.env.ASSIGN_FORCE_LIST_BUTTON ||
-  "[aria-label='List view'], [aria-label='List'], [title='List'], [title*='List'], button[aria-label*='List'], button[title*='List'], .bb-icon-list, .fa-list, [data-automation-id*='list-view'], [data-view='list'], [data-testid*='listView']";
+  "[aria-label='List view'], [aria-label='List'], [title='List'], button[title*='List'], button[aria-label*='List'], [data-automation-id*='list-view'], [data-view='list'], [data-testid*='listView']";
 
 // Optional Google Drive upload
 const SA_JSON          = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
-const GDRIVE_FOLDER_ID = process.env.GOOGLE_SERVICE_ACCOUNT_FOLDER_ID || process.env.GDRIVE_FOLDER_ID || "";
+const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID || process.env.GOOGLE_SERVICE_ACCOUNT_FOLDER_ID || "";
 
-/* ===================== Helpers: Google Drive ===================== */
+/* ===================== Helpers ===================== */
+function logPhase(msg) {
+  console.log(`[PHASE] ${msg}`);
+}
+
 function driveClientOrNull() {
   try {
     if (!SA_JSON) return null;
@@ -80,11 +81,7 @@ const streamToBuffer = (rs) =>
 
 async function uploadBufferToDrive(drive, name, buffer, mimeType = "application/octet-stream") {
   const create = await drive.files.create({
-    requestBody: {
-      name,
-      parents: GDRIVE_FOLDER_ID ? [GDRIVE_FOLDER_ID] : undefined,
-      mimeType
-    },
+    requestBody: { name, parents: GDRIVE_FOLDER_ID ? [GDRIVE_FOLDER_ID] : undefined, mimeType },
     media: { mimeType, body: buffer }
   });
   const fileId = create.data.id;
@@ -98,16 +95,52 @@ async function uploadBufferToDrive(drive, name, buffer, mimeType = "application/
   };
 }
 
-/* ===================== Auth Flow ===================== */
+/* ===================== Login Flow ===================== */
+/**
+ * Clicks a visible Sign in / SSO button inside the SPA #login screen if present.
+ */
+async function clickSpaLoginIfPresent(page) {
+  const candidates = [
+    // Common SPA login UI bits
+    "button:has-text('Sign in')",
+    "a:has-text('Sign in')",
+    "button:has-text('Log in')",
+    "a:has-text('Log in')",
+    "button:has-text('Sign in with')",
+    "a:has-text('Sign in with')",
+    "[data-automation-id*='sign-in']",
+    "[data-testid*='signin']",
+  ];
+  for (const sel of candidates) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.count()) {
+        logPhase(`SPA login control found: ${sel}`);
+        await Promise.all([
+          page.waitForLoadState("domcontentloaded"),
+          el.click().catch(() => {})
+        ]);
+        await page.waitForTimeout(800);
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+
+/**
+ * Full BBID + Microsoft flow with retries.
+ */
 async function loginBlackbaud(page) {
   if (!BB_BASE || !BB_USERNAME || !BB_PASSWORD) {
     throw new Error("Missing env: BB_BASE, BB_USERNAME, BB_PASSWORD are required.");
   }
 
-  // Try a few starting points to land in an auth-able state
+  logPhase("Open entry page");
   const candidates = [
     `${BB_BASE}/signin`,
     `${BB_BASE}/app/login`,
+    `${BB_BASE}/app/student`,
     "https://app.blackbaud.com/signin",
     `${BB_BASE}/`
   ];
@@ -115,27 +148,34 @@ async function loginBlackbaud(page) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
       break;
-    } catch { /* keep trying */ }
+    } catch {}
   }
 
-  // School-specific SSO button (if shown)
-  const ssoBtn = page
-    .getByRole("button", { name: /sierra canyon school/i })
-    .or(page.getByRole("link", { name: /sierra canyon school/i }));
+  // If SPA shows #login immediately, attempt to click its Sign in button
+  if (/#login\b/i.test(page.url())) {
+    logPhase(`SPA shows #login at ${page.url()}`);
+    const clicked = await clickSpaLoginIfPresent(page);
+    if (clicked) {
+      await page.waitForTimeout(800);
+    }
+  }
+
+  // Handle school SSO button (e.g., "Sierra Canyon School")
+  const ssoBtn = page.getByRole("button", { name: /sierra canyon school/i })
+                     .or(page.getByRole("link", { name: /sierra canyon school/i }));
   if (await ssoBtn.count()) {
-    await Promise.all([
-      page.waitForLoadState("domcontentloaded"),
-      ssoBtn.click()
-    ]);
+    logPhase("Click school SSO button");
+    await Promise.all([page.waitForLoadState("domcontentloaded"), ssoBtn.click()]);
   }
 
-  // BBID email screen
+  // BBID email screen (app.blackbaud.com)
   const emailInput = page
-    .getByRole("textbox", { name: /bbid.*email/i })
-    .or(page.locator("input[type='email'], input[name*='email'], #Username"));
+    .locator("input[type='email'], input[name*='email'], #Username, #bbid-email")
+    .first();
   if (await emailInput.count()) {
+    logPhase("Fill BBID email");
     await emailInput.fill(BB_USERNAME);
-    const nextBtn = page.getByRole("button", { name: /next|continue/i });
+    const nextBtn = page.getByRole("button", { name: /next|continue/i }).first();
     if (await nextBtn.count()) {
       await Promise.all([
         page.waitForNavigation({ waitUntil: "domcontentloaded" }),
@@ -144,10 +184,12 @@ async function loginBlackbaud(page) {
     }
   }
 
+  // Microsoft flow
   if (page.url().includes("login.microsoftonline.com")) {
-    // Microsoft email (sometimes re-asked)
-    const msEmail = page.locator("input[type='email']");
+    // Sometimes they re-ask email
+    const msEmail = page.locator("input[type='email']").first();
     if (await msEmail.count()) {
+      logPhase("MS asks email again");
       await msEmail.fill(BB_USERNAME);
       await Promise.all([
         page.waitForNavigation({ waitUntil: "domcontentloaded" }),
@@ -155,9 +197,10 @@ async function loginBlackbaud(page) {
       ]);
     }
 
-    // Microsoft password
-    const msPass = page.locator("input[type='password']");
+    // MS password
+    const msPass = page.locator("input[type='password']").first();
     if (await msPass.count()) {
+      logPhase("MS fill password");
       await msPass.fill(BB_PASSWORD);
       await Promise.all([
         page.waitForNavigation({ waitUntil: "domcontentloaded" }),
@@ -165,10 +208,11 @@ async function loginBlackbaud(page) {
       ]);
     }
 
-    // KMSI dialog
-    for (let i = 0; i < 3; i++) {
+    // Stay signed in (KMSI)
+    for (let i = 0; i < 5; i++) {
       const kmsiText = page.getByText(/stay signed in\?|keep me signed in/i);
       if (await kmsiText.count()) {
+        logPhase("MS KMSI detected");
         const dontShow = page.getByRole("checkbox", { name: /don't show this again/i });
         if (await dontShow.count()) await dontShow.check().catch(() => {});
         const yesBtn = page.getByRole("button", { name: /^yes$/i });
@@ -183,14 +227,15 @@ async function loginBlackbaud(page) {
         }
         break;
       }
-      await page.waitForTimeout(800);
+      await page.waitForTimeout(500);
     }
   } else {
     // Native Blackbaud password page
-    const pass = page.locator("input[type='password'], input[name*='password']");
+    const pass = page.locator("input[type='password'], input[name*='password']").first();
     if (await pass.count()) {
+      logPhase("Native BB password");
       await pass.fill(BB_PASSWORD);
-      const signIn = page.getByRole("button", { name: /sign in|submit|log in/i });
+      const signIn = page.getByRole("button", { name: /sign in|submit|log in/i }).first();
       if (await signIn.count()) {
         await Promise.all([
           page.waitForNavigation({ waitUntil: "domcontentloaded" }),
@@ -200,35 +245,23 @@ async function loginBlackbaud(page) {
     }
   }
 
-  // Ensure Student app is open; if we see #login, drive the sign-in again
-  await page.waitForTimeout(1200);
-  if (!/\/app\/student/i.test(page.url())) {
-    await page.goto(`${BB_BASE}/app/student`, { waitUntil: "domcontentloaded" });
-  }
+  // Land in student app
+  logPhase("Ensure /app/student loads");
+  await page.goto(`${BB_BASE}/app/student`, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1000);
 
-  for (let tries = 0; tries < 2; tries++) {
+  // If we still see #login, try one more SPA click and/or re-run BBID
+  for (let attempt = 1; attempt <= 2; attempt++) {
     if (!/#login\b/i.test(page.url())) break;
-
-    // Try a visible "Sign in" control inside SPA
-    const signInBtn = page
-      .getByRole("button", { name: /sign in|log in/i })
-      .or(page.getByRole("link", { name: /sign in|log in/i }))
-      .or(page.getByText(/^sign in$/i));
-
-    if (await signInBtn.count()) {
-      await Promise.all([
-        page.waitForLoadState("domcontentloaded"),
-        signInBtn.first().click().catch(() => {})
-      ]);
-      await page.waitForTimeout(1000);
-    } else {
-      // Re-run BBID flow
+    logPhase(`Still at #login (attempt ${attempt}) → try SPA button`);
+    const clicked = await clickSpaLoginIfPresent(page);
+    if (!clicked) {
+      logPhase("SPA had no button → go directly to BBID signin");
       await page.goto("https://app.blackbaud.com/signin", { waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(600);
-      const email2 = page.locator("input[type='email'], input[name*='email'], #Username");
+      const email2 = page.locator("input[type='email'], input[name*='email'], #Username, #bbid-email").first();
       if (await email2.count()) {
         await email2.fill(BB_USERNAME);
-        const next2 = page.getByRole("button", { name: /next|continue/i });
+        const next2 = page.getByRole("button", { name: /next|continue/i }).first();
         if (await next2.count()) {
           await Promise.all([
             page.waitForNavigation({ waitUntil: "domcontentloaded" }),
@@ -237,7 +270,7 @@ async function loginBlackbaud(page) {
         }
       }
       if (page.url().includes("login.microsoftonline.com")) {
-        const msPass2 = page.locator("input[type='password']");
+        const msPass2 = page.locator("input[type='password']").first();
         if (await msPass2.count()) {
           await msPass2.fill(BB_PASSWORD);
           await Promise.all([
@@ -245,9 +278,9 @@ async function loginBlackbaud(page) {
             page.getByRole("button", { name: /^sign in$/i }).click()
           ]);
         }
-        for (let k = 0; k < 3; k++) {
-          const kmsiText = page.getByText(/stay signed in\?|keep me signed in/i);
-          if (await kmsiText.count()) {
+        for (let k = 0; k < 4; k++) {
+          const kmsi = page.getByText(/stay signed in\?|keep me signed in/i);
+          if (await kmsi.count()) {
             const dontShow = page.getByRole("checkbox", { name: /don't show this again/i });
             if (await dontShow.count()) await dontShow.check().catch(() => {});
             const yesBtn = page.getByRole("button", { name: /^yes$/i });
@@ -262,13 +295,13 @@ async function loginBlackbaud(page) {
             }
             break;
           }
-          await page.waitForTimeout(800);
+          await page.waitForTimeout(500);
         }
       } else {
-        const pass2 = page.locator("input[type='password'], input[name*='password']");
+        const pass2 = page.locator("input[type='password'], input[name*='password']").first();
         if (await pass2.count()) {
           await pass2.fill(BB_PASSWORD);
-          const sign2 = page.getByRole("button", { name: /sign in|submit|log in/i });
+          const sign2 = page.getByRole("button", { name: /sign in|submit|log in/i }).first();
           if (await sign2.count()) {
             await Promise.all([
               page.waitForNavigation({ waitUntil: "domcontentloaded" }),
@@ -278,58 +311,63 @@ async function loginBlackbaud(page) {
         }
       }
     }
-
     await page.goto(`${BB_BASE}/app/student`, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(1000);
   }
+
+  if (/#login\b/i.test(page.url())) {
+    throw new Error(`Login failed; still at #login after retries. url=${page.url()}`);
+  }
+
+  logPhase("Login complete");
 }
 
 /* ===================== Assignment Center ===================== */
 async function openAssignmentCenter(page) {
-  // Go to Assignment Center
+  logPhase("Open Assignment Center");
   await page.goto(`${BB_BASE}/app/student#assignment-center`, {
     waitUntil: "domcontentloaded",
     timeout: 120000
   });
   await page.waitForTimeout(1000);
 
-  // If SPA bounced to #login, re-login once
+  // If SPA redirected back to #login (session not established), re-login once
   if (/#login\b/i.test(page.url())) {
+    logPhase("Assignment Center bounced to #login → re-login once");
     await loginBlackbaud(page);
     await page.goto(`${BB_BASE}/app/student#assignment-center`, {
       waitUntil: "domcontentloaded",
       timeout: 120000
     });
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(1200);
   }
 
-  // Try to force List view (various tenants differ)
-  const listCandidates = [
+  // Force "List view" if possible
+  const listBtns = [
     ASSIGN_FORCE_LIST_BUTTON,
     "[aria-label='List view']",
     "[aria-label='List']",
     "[title='List']",
     "button[title*='List']",
     "button[aria-label*='List']",
-    ".bb-icon-list",
-    ".fa-list",
     "[data-automation-id*='list-view']",
     "[data-view='list']",
     "[data-testid*='listView']"
   ].filter(Boolean);
 
-  for (const sel of listCandidates) {
+  for (const sel of listBtns) {
     try {
-      const btn = page.locator(sel).first();
-      if (await btn.count()) {
-        await btn.click({ timeout: 1500 }).catch(() => {});
-        await page.waitForTimeout(600);
+      const b = page.locator(sel).first();
+      if (await b.count()) {
+        logPhase(`Click list view button: ${sel}`);
+        await b.click({ timeout: 1500 }).catch(() => {});
+        await page.waitForTimeout(700);
         break;
       }
-    } catch { /* continue */ }
+    } catch {}
   }
 
-  // Wait for container presence (best effort)
+  // Wait for container to present
   await page.waitForSelector(LINK_CONTAINER_SELECTOR, { timeout: 60000 }).catch(() => {});
 }
 
@@ -351,7 +389,7 @@ async function scrapeAssignments() {
     await loginBlackbaud(page);
     await openAssignmentCenter(page);
 
-    // Try specific selector, then broaden progressively
+    logPhase("Collect list of assignments");
     let links = [];
     try {
       links = await page.$$eval(LIST_LINK_SELECTOR, (as) =>
@@ -390,7 +428,8 @@ async function scrapeAssignments() {
       throw new Error(`No assignments found after navigating to Assignment Center. url=${page.url()}`);
     }
 
-    // Visit each assignment detail
+    logPhase(`Found ${uniqueLinks.length} assignment links`);
+
     const assignments = [];
     for (const { href } of uniqueLinks) {
       const detail = await context.newPage();
@@ -417,7 +456,6 @@ async function scrapeAssignments() {
           const a = resLoc.nth(i);
           const label = ((await a.textContent().catch(() => "")) || "resource").trim();
 
-          // Try to download, else just capture href
           const [dl] = await Promise.all([
             detail.waitForEvent("download").catch(() => null),
             a.click().catch(() => null)
@@ -442,6 +480,7 @@ async function scrapeAssignments() {
     }
 
     await browser.close().catch(() => {});
+    logPhase("Scrape complete");
     return { scrapedAt: new Date().toISOString(), assignments };
   } catch (e) {
     await browser.close().catch(() => {});
