@@ -1,36 +1,55 @@
-// server.mjs
+// server.mjs — Blackbaud → Assignments → (optional) Drive links
 import express from "express";
 import { chromium } from "playwright";
 import { google } from "googleapis";
 
-const app = express();
-app.use(express.json({ limit: "1mb" }));
-
-/* ----------------------------- ENV CONFIG ----------------------------- */
-// Required
+/* ===================== ENV ===================== */
 const SECRET      = process.env.WEBHOOK_SECRET || "change-me";
-const BB_USERNAME = process.env.BB_USERNAME;
-const BB_PASSWORD = process.env.BB_PASSWORD;
-const BB_BASE     = (process.env.BB_BASE || "").trim().replace(/\/+$/, ""); // no trailing slash
+const BB_BASE     = (process.env.BB_BASE || "").replace(/\/+$/, "");
+const BB_USERNAME = process.env.BB_USERNAME || "";
+const BB_PASSWORD = process.env.BB_PASSWORD || "";
 
-// URLs (override if your school uses different paths)
-const LOGIN_URL  = process.env.BB_LOGIN_URL  || `${BB_BASE}/app/login`;
-const ASSIGN_URL = process.env.BB_ASSIGN_URL || `${BB_BASE}/app/student#assignment-center`;
+// Selectors (can be overridden via Render env)
+const LINK_CONTAINER_SELECTOR =
+  process.env.LINK_CONTAINER_SELECTOR || '[role="main"], .main, #content, body';
 
-// Selectors (can override via env if DOM differs)
-const LIST_LINK_SELECTOR     = process.env.LIST_LINK_SELECTOR     || 'a[href*="Assignment"], a[href*="assignment"]';
-const DETAIL_TITLE_SELECTOR  = process.env.DETAIL_TITLE_SELECTOR  || "h1, .assignment-title, .detail-title";
-const DETAIL_COURSE_SELECTOR = process.env.DETAIL_COURSE_SELECTOR || ".assignment-course, .detail-course";
-const DETAIL_DUE_SELECTOR    = process.env.DETAIL_DUE_SELECTOR    || ".assignment-due, .detail-due";
-const DETAIL_DESC_SELECTOR   = process.env.DETAIL_DESC_SELECTOR   || ".assignment-description, .detail-description";
-const DETAIL_RES_AREA_SEL    = process.env.DETAIL_RES_AREA_SEL    || ".assignment-resources, .detail-resources";
-const DETAIL_RES_ANCH_SEL    = process.env.DETAIL_RES_ANCH_SEL    || `${DETAIL_RES_AREA_SEL} a, a.resource-link`;
+const LIST_LINK_SELECTOR =
+  process.env.LIST_LINK_SELECTOR
+  || 'a[href*="/lms-assignment/assignment/assignment-student-view/"]';
 
-// Google Drive (optional – for public attachment links)
-const SA_JSON         = process.env.GOOGLE_SERVICE_ACCOUNT_JSON; // full JSON
-const GDRIVE_FOLDERID = process.env.GDRIVE_FOLDER_ID || null;
+const DETAIL_TITLE_SELECTOR =
+  process.env.DETAIL_TITLE_SELECTOR
+  || 'h1, h2, .page-title, [data-automation-id="assignment-title"]';
 
-/* --------------------------- HELPERS (Drive) -------------------------- */
+const DETAIL_COURSE_SELECTOR =
+  process.env.DETAIL_COURSE_SELECTOR
+  || '[class*="class"], [data-automation-id*="course"], .assignment-class';
+
+const DETAIL_DUE_SELECTOR =
+  process.env.DETAIL_DUE_SELECTOR
+  || '[class*="due"], [data-automation-id*="due"], .assignment-due';
+
+const DETAIL_DESC_SELECTOR =
+  process.env.DETAIL_DESC_SELECTOR
+  || '[class*="description"], [id*="description"], [data-automation-id*="description"]';
+
+const DETAIL_RES_AREA_SEL =
+  process.env.DETAIL_RES_AREA_SEL
+  || 'section:has(:text("Links & downloads")), [class*="links"], [id*="links"]';
+
+const DETAIL_RES_ANCH_SEL =
+  process.env.DETAIL_RES_ANCH_SEL
+  || `${DETAIL_RES_AREA_SEL} a, a[href*="/download/"], a[download]`;
+
+const ASSIGN_FORCE_LIST_BUTTON =
+  process.env.ASSIGN_FORCE_LIST_BUTTON
+  || '[aria-label="List view"], [title*="List"], button:has(:text("List"))';
+
+// Google Drive (optional)
+const SA_JSON         = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
+const GDRIVE_FOLDERID = process.env.GDRIVE_FOLDER_ID || "";
+
+/* ===================== DRIVE HELPERS ===================== */
 function driveClientOrNull() {
   try {
     if (!SA_JSON) return null;
@@ -47,6 +66,13 @@ function driveClientOrNull() {
     return null;
   }
 }
+const streamToBuffer = (rs) =>
+  new Promise((resolve, reject) => {
+    const chunks = [];
+    rs.on("data", d => chunks.push(d));
+    rs.on("end", () => resolve(Buffer.concat(chunks)));
+    rs.on("error", reject);
+  });
 
 async function uploadBufferToDrive(drive, name, buffer, mimeType = "application/octet-stream") {
   const create = await drive.files.create({
@@ -64,153 +90,246 @@ async function uploadBufferToDrive(drive, name, buffer, mimeType = "application/
   };
 }
 
-function streamToBuffer(rs) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    rs.on("data", d => chunks.push(d));
-    rs.on("end", () => resolve(Buffer.concat(chunks)));
-    rs.on("error", reject);
-  });
-}
-
-/* --------------------------- SCRAPE ENDPOINT -------------------------- */
-app.post("/scrape", async (req, res) => {
-  if (req.header("X-Webhook-Secret") !== SECRET) {
-    return res.status(401).json({ error: "unauthorized" });
-  }
-  if (!BB_USERNAME || !BB_PASSWORD || !BB_BASE) {
-    return res.status(400).json({ error: "missing required env (BB_USERNAME, BB_PASSWORD, BB_BASE)" });
+/* ===================== LOGIN + NAV ===================== */
+async function loginBlackbaud(page) {
+  // Try a few starting points
+  const candidates = [
+    `${BB_BASE}/signin`,
+    `${BB_BASE}/app/login`,
+    "https://app.blackbaud.com/signin",
+    `${BB_BASE}/`
+  ];
+  for (const url of candidates) {
+    try { await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 }); break; }
+    catch {}
   }
 
-  let browser;
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"]
-    });
-    const context = await browser.newContext({ acceptDownloads: true });
-    const page = await context.newPage();
+  // (1) “Sierra Canyon School” SSO button
+  const ssoBtn = page.getByRole('button', { name: /sierra canyon school/i })
+                     .or(page.getByRole('link', { name: /sierra canyon school/i }));
+  if (await ssoBtn.count()) {
+    await Promise.all([page.waitForLoadState('domcontentloaded'), ssoBtn.click()]);
+  }
 
-    // -------- Login flow --------
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+  // (2) BBID email page
+  const emailInput = page.getByRole('textbox', { name: /bbid.*email/i })
+                         .or(page.locator('input[type="email"], input[name*="email"], #Username'));
+  if (await emailInput.count()) {
+    await emailInput.fill(BB_USERNAME);
+    const nextBtn = page.getByRole('button', { name: /next|continue/i });
+    if (await nextBtn.count()) {
+      await Promise.all([page.waitForLoadState('domcontentloaded'), nextBtn.click()]);
+    }
+  }
 
-    if (await page.locator('input[name="username"]').count()) {
-      await page.fill('input[name="username"]', BB_USERNAME);
-      await page.fill('input[name="password"]', BB_PASSWORD);
-      await Promise.all([
-        page.waitForLoadState("networkidle"),
-        page.click('button[type="submit"]')
-      ]);
-    } else {
-      // SSO path (adjust if your page text differs)
-      const ssoBtn = page.locator("text=Sign in with SSO");
-      if (await ssoBtn.count()) {
+ // (3a) Microsoft login flow
+if (page.url().includes("login.microsoftonline.com")) {
+  // Email (sometimes shown again)
+  const msEmail = page.locator('input[type="email"]');
+  if (await msEmail.count()) {
+    await msEmail.fill(BB_USERNAME);
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "domcontentloaded" }),
+      page.getByRole('button', { name: /next/i }).click()
+    ]);
+  }
+
+  // Password
+  const msPass = page.locator('input[type="password"]');
+  if (await msPass.count()) {
+    await msPass.fill(BB_PASSWORD);
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "domcontentloaded" }),
+      page.getByRole('button', { name: /^sign in$/i }).click()
+    ]);
+  }
+
+  // --- Stay signed in? (KMSI) dialog ---
+  // We handle both the text prompt and buttons; also tick "Don't show this again" if present.
+  for (let i = 0; i < 3; i++) { // give it a few seconds to appear
+    const kmsiText = page.getByText(/stay signed in\?|keep me signed in/i);
+    if (await kmsiText.count()) {
+      const dontShow = page.getByRole('checkbox', { name: /don't show this again/i });
+      if (await dontShow.count()) { await dontShow.check().catch(() => {}); }
+
+      const yesBtn = page.getByRole('button', { name: /^yes$/i });
+      const okBtn  = page.getByRole('button', { name: /^ok$/i });
+      const noBtn  = page.getByRole('button', { name: /^no$/i });
+
+      if (await yesBtn.count()) {
         await Promise.all([
-          page.waitForLoadState("networkidle"),
-          ssoBtn.click()
+          page.waitForLoadState('domcontentloaded'),
+          yesBtn.click()
+        ]);
+      } else if (await okBtn.count()) {
+        await Promise.all([
+          page.waitForLoadState('domcontentloaded'),
+          okBtn.click()
+        ]);
+      } else if (await noBtn.count()) {
+        await Promise.all([
+          page.waitForLoadState('domcontentloaded'),
+          noBtn.click()
         ]);
       }
+      break;
     }
-
-    // -------- Assignment list --------
-    // Navigate to the Assignments page (hash route => don't wait for networkidle)
-await page.goto(ASSIGN_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
-
-// Give the SPA time to render and then poll for assignment links
-let listLinks, found = false;
-for (let i = 0; i < 20; i++) {               // up to ~20s total
-  await page.waitForTimeout(1000);
-  listLinks = page.locator(LIST_LINK_SELECTOR);
-  const c = await listLinks.count().catch(() => 0);
-  if (c > 0) { found = true; break; }
-}
-
-// If still nothing, try a soft reload of the hash route once
-if (!found) {
-  await page.evaluate(url => { window.location.href = url; }, ASSIGN_URL);
-  for (let i = 0; i < 20; i++) {
     await page.waitForTimeout(1000);
-    listLinks = page.locator(LIST_LINK_SELECTOR);
-    const c = await listLinks.count().catch(() => 0);
-    if (c > 0) { found = true; break; }
+  }
+} else {
+  // (3b) Native BB password page
+  const pass = page.locator('input[type="password"], input[name*="password"]');
+  if (await pass.count()) {
+    await pass.fill(BB_PASSWORD);
+    const signIn = page.getByRole('button', { name: /sign in|submit|log in/i });
+    if (await signIn.count()) {
+      await Promise.all([page.waitForLoadState('domcontentloaded'), signIn.click()]);
+    }
   }
 }
 
-if (!found) {
-  throw new Error("Could not find any assignments on the page (LIST_LINK_SELECTOR matched 0 elements).");
+  // Ensure we’re inside the student app
+  await page.waitForTimeout(1500);
+  if (!/\/app\/student/i.test(page.url())) {
+    await page.goto(`${BB_BASE}/app/student`, { waitUntil: "domcontentloaded" });
+  }
 }
 
-    const listCount = await listLinks.count();
-    const drive = driveClientOrNull();
+async function openAssignmentCenter(page) {
+  // Try direct hash first
+  await page.goto(`${BB_BASE}/app/student#assignment-center`, { waitUntil: "domcontentloaded", timeout: 120000 });
+
+  // Optional: force List view (so real anchors render)
+  const listBtn = page.locator(ASSIGN_FORCE_LIST_BUTTON);
+  if (await listBtn.count()) { await listBtn.first().click().catch(() => {}); await page.waitForTimeout(800); }
+
+  // If no links yet, open the My Day dropdown and click Assignment Center
+  let haveLinks = false;
+  for (let i = 0; i < 12; i++) {
+    const c = await page.locator(LIST_LINK_SELECTOR).count().catch(() => 0);
+    if (c > 0) { haveLinks = true; break; }
+    await page.waitForTimeout(1000);
+  }
+  if (!haveLinks) {
+    const myDay = page.getByRole('button', { name: /^my day$/i }).or(page.getByRole('link', { name: /^my day$/i }));
+    if (await myDay.count()) await myDay.first().click().catch(() => {});
+    const ac = page.getByRole('menuitem', { name: /assignment center/i })
+                   .or(page.getByRole('link', { name: /assignment center/i }))
+                   .or(page.getByText(/assignment center/i));
+    if (await ac.count()) await ac.first().click().catch(() => {});
+    await page.waitForTimeout(1200);
+  }
+
+  // Wait for container + poll for links
+  await page.waitForSelector(LINK_CONTAINER_SELECTOR, { timeout: 60000 }).catch(() => {});
+  for (let i = 0; i < 20; i++) {
+    const c = await page.locator(LIST_LINK_SELECTOR).count().catch(() => 0);
+    if (c > 0) return;
+    await page.waitForTimeout(1000);
+  }
+  throw new Error("No assignments found after navigating to Assignment Center.");
+}
+
+/* ===================== SCRAPE ===================== */
+async function scrapeAssignments() {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+  const context = await browser.newContext({ acceptDownloads: true });
+  const page = await context.newPage();
+  const drive = driveClientOrNull();
+
+  try {
+    if (!BB_BASE || !BB_USERNAME || !BB_PASSWORD) {
+      throw new Error("Missing env: BB_BASE, BB_USERNAME, BB_PASSWORD are required.");
+    }
+
+    await loginBlackbaud(page);
+    await openAssignmentCenter(page);
+
+    // Collect links on the list page
+    const links = await page.$$eval(LIST_LINK_SELECTOR, as =>
+      as.map(a => ({ href: a.href, text: a.textContent?.trim() || "" }))
+    );
+    const unique = links.filter((v, i, arr) => arr.findIndex(x => x.href === v.href) === i);
+
     const assignments = [];
-
-    for (let i = 0; i < listCount; i++) {
-      const link = listLinks.nth(i);
-
-      // Open in a new tab so the list page stays intact
-      const [detailPage] = await Promise.all([
-        context.waitForEvent("page"),
-        link.click()
-      ]);
-
+    for (const { href } of unique) {
+      const detail = await context.newPage();
       try {
-        await detailPage.waitForLoadState("networkidle", { timeout: 60000 });
-        await detailPage.waitForTimeout(500);
+        await detail.goto(href, { waitUntil: "domcontentloaded", timeout: 120000 });
+        await detail.waitForTimeout(500);
 
-        const getText = async (sel) =>
-          ((await detailPage.locator(sel).first().textContent().catch(() => "")) || "").trim();
+        const getText = async (sel) => {
+          try { return ((await detail.locator(sel).first().textContent()) || "").trim(); }
+          catch { return ""; }
+        };
 
         const title       = await getText(DETAIL_TITLE_SELECTOR);
         const course      = await getText(DETAIL_COURSE_SELECTOR);
         const due         = await getText(DETAIL_DUE_SELECTOR);
         const description = await getText(DETAIL_DESC_SELECTOR);
 
-        // Resources/attachments
-        const resAnchors = detailPage.locator(DETAIL_RES_ANCH_SEL);
-        const rCount = await resAnchors.count();
+        // Resources
+        const resLoc = detail.locator(DETAIL_RES_ANCH_SEL);
+        const rCount = await resLoc.count().catch(() => 0);
         const resources = [];
 
-        for (let r = 0; r < rCount; r++) {
-          const a = resAnchors.nth(r);
-          const linkText = ((await a.textContent().catch(() => "")) || "resource").trim();
+        for (let i = 0; i < rCount; i++) {
+          const a = resLoc.nth(i);
+          const label = ((await a.textContent().catch(() => "")) || "resource").trim();
 
-          // Click and see if a file download starts
+          // Try to trigger a download; if no download, capture the href
           const [dl] = await Promise.all([
-            detailPage.waitForEvent("download").catch(() => null),
-            a.click()
+            detail.waitForEvent("download").catch(() => null),
+            a.click().catch(() => null)
           ]);
 
           if (dl && drive) {
-            // Upload downloaded file to Drive -> return public link
-            const suggested = (await dl.suggestedFilename().catch(() => linkText)) || linkText;
+            const suggested = (await dl.suggestedFilename().catch(() => label)) || label;
             const rs = await dl.createReadStream();
             const buf = await streamToBuffer(rs);
             const uploaded = await uploadBufferToDrive(drive, suggested, buf);
             resources.push({ name: uploaded.name, href: uploaded.href, mimeType: uploaded.mimeType });
           } else {
-            // Not a file download (or Drive not configured) -> just keep href
             const href = await a.getAttribute("href");
-            if (href) resources.push({ name: linkText, href, mimeType: "text/html" });
+            if (href) resources.push({ name: label, href, mimeType: "text/html" });
           }
         }
 
-        assignments.push({ title, course, due, description, resources });
+        assignments.push({ title, course, due, description, resources, url: href });
       } finally {
-        await detailPage.close().catch(() => {});
+        await detail.close().catch(() => {});
       }
     }
 
     await browser.close().catch(() => {});
-    return res.json({ scrapedAt: new Date().toISOString(), assignments });
+    return { scrapedAt: new Date().toISOString(), assignments };
+  } catch (e) {
+    await browser.close().catch(() => {});
+    throw e;
+  }
+}
+
+/* ===================== HTTP SERVER ===================== */
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+app.get("/", (_req, res) => res.send("OK"));
+
+app.post("/scrape", async (req, res) => {
+  if (req.header("X-Webhook-Secret") !== SECRET) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  try {
+    const data = await scrapeAssignments();
+    res.json(data);
   } catch (err) {
-    if (browser) await browser.close().catch(() => {});
     console.error("SCRAPE_ERROR:", err?.message || err);
-    return res.status(500).json({ error: String(err) });
+    res.status(500).json({ error: String(err?.message || err) });
   }
 });
-
-/* --------------------------- HEALTH CHECK ----------------------------- */
-app.get("/", (_req, res) => res.send("OK"));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("listening on " + port));
