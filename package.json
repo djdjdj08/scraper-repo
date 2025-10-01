@@ -6,7 +6,7 @@
   "scripts": { "start": "node server.mjs" },
   "dependencies": {
     "express": "^4.19.2",
-    "playwright": "^1.47.2",
+    "playwright": "^1.55.1",
     "googleapis": "^133.0.0"
   }
 }
