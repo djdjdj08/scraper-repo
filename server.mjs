@@ -205,13 +205,19 @@ async function openAssignmentCenter(page) {
   // Give the SPA time to hydrate
   await page.waitForTimeout(1500);
 
-  // Try to force List view 3 ways (tenants differ)
+  // Try to force List view in several common ways (tenants differ)
   const candidateListButtons = [
-    ASSIGN_FORCE_LIST_BUTTON,                                         // from env
-    '[aria-label="List view"]', '[aria-label="List"]',
-    '[title="List"]', 'button[title*="List"]', 'button[aria-label*="List"]',
-    '.bb-icon-list', '.fa-list', '[data-automation-id*="list-view"]',
-    '[data-view="list"]', '[data-testid*="listView"]',
+    ASSIGN_FORCE_LIST_BUTTON,                            // from env (may be empty)
+    '[aria-label="List view"]',
+    '[aria-label="List"]',
+    '[title="List"]',
+    'button[title*="List"]',
+    'button[aria-label*="List"]',
+    '.bb-icon-list',
+    '.fa-list',
+    '[data-automation-id*="list-view"]',
+    '[data-view="list"]',
+    '[data-testid*="listView"]',
   ].filter(Boolean);
 
   for (const sel of candidateListButtons) {
@@ -220,44 +226,48 @@ async function openAssignmentCenter(page) {
       if (await btn.count()) {
         await btn.click({ timeout: 1500 }).catch(() => {});
         await page.waitForTimeout(800);
-        break; // assume it worked
+        break; // assume list view is active now
       }
-    } catch {}
+    } catch {
+      // ignore and try next candidate
+    }
   }
 
-  // If no links yet, use the My Day menu → Assignment Center path once
+  // If no links yet, try the My Day menu -> Assignment Center path once
   let haveLinks = false;
   for (let i = 0; i < 8; i++) {
     const c = await page.locator(LIST_LINK_SELECTOR).count().catch(() => 0);
-    if (c > 0) { haveLinks = true; break; }
+    if (c > 0) {
+      haveLinks = true;
+      break;
+    }
     await page.waitForTimeout(500);
   }
+
   if (!haveLinks) {
-    const myDay = page.getByRole('button', { name: /^my day$/i })
-                      .or(page.getByRole('link', { name: /^my day$/i }));
-    if (await myDay.count()) await myDay.first().click().catch(() => {});
-    const ac = page.getByRole('menuitem', { name: /assignment center/i })
-                   .or(page.getByRole('link', { name: /assignment center/i }))
-                   .or(page.getByText(/assignment center/i));
-    if (await ac.count()) await ac.first().click().catch(() => {});
-    await page.waitForTimeout(1200);
+    try {
+      const myDay = page
+        .getByRole("button", { name: /^my day$/i })
+        .or(page.getByRole("link", { name: /^my day$/i }));
+      if (await myDay.count()) await myDay.first().click().catch(() => {});
+
+      const ac = page
+        .getByRole("menuitem", { name: /assignment center/i })
+        .or(page.getByRole("link", { name: /assignment center/i }))
+        .or(page.getByText(/assignment center/i));
+      if (await ac.count()) await ac.first().click().catch(() => {});
+      await page.waitForTimeout(1200);
+    } catch {
+      // ignore – we'll rely on broad selectors below
+    }
   }
 
-  // Wait for the main container to exist (best-effort)
-  const containerSel = LINK_CONTAINER_SELECTOR || 'main, [role="main"], #content';
+  // Wait for the main container to exist (best effort)
+  const containerSel =
+    LINK_CONTAINER_SELECTOR || "main, [role='main'], #content";
   await page.waitForSelector(containerSel, { timeout: 60000 }).catch(() => {});
 }
 
-
-  // Wait for container + poll for links
-  await page.waitForSelector(LINK_CONTAINER_SELECTOR, { timeout: 60000 }).catch(() => {});
-  for (let i = 0; i < 20; i++) {
-    const c = await page.locator(LIST_LINK_SELECTOR).count().catch(() => 0);
-    if (c > 0) return;
-    await page.waitForTimeout(1000);
-  }
-  throw new Error("No assignments found after navigating to Assignment Center.");
-}
 
 /* ===================== SCRAPE ===================== */
 async function scrapeAssignments() {
