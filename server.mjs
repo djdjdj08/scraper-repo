@@ -197,21 +197,44 @@ if (page.url().includes("login.microsoftonline.com")) {
 
 async function openAssignmentCenter(page) {
   // Try direct hash first
-  await page.goto(`${BB_BASE}/app/student#assignment-center`, { waitUntil: "domcontentloaded", timeout: 120000 });
+  await page.goto(`${BB_BASE}/app/student#assignment-center`, {
+    waitUntil: "domcontentloaded",
+    timeout: 120000,
+  });
 
-  // Optional: force List view (so real anchors render)
-  const listBtn = page.locator(ASSIGN_FORCE_LIST_BUTTON);
-  if (await listBtn.count()) { await listBtn.first().click().catch(() => {}); await page.waitForTimeout(800); }
+  // Give the SPA time to hydrate
+  await page.waitForTimeout(1500);
 
-  // If no links yet, open the My Day dropdown and click Assignment Center
+  // Try to force List view 3 ways (tenants differ)
+  const candidateListButtons = [
+    ASSIGN_FORCE_LIST_BUTTON,                                         // from env
+    '[aria-label="List view"]', '[aria-label="List"]',
+    '[title="List"]', 'button[title*="List"]', 'button[aria-label*="List"]',
+    '.bb-icon-list', '.fa-list', '[data-automation-id*="list-view"]',
+    '[data-view="list"]', '[data-testid*="listView"]',
+  ].filter(Boolean);
+
+  for (const sel of candidateListButtons) {
+    try {
+      const btn = page.locator(sel).first();
+      if (await btn.count()) {
+        await btn.click({ timeout: 1500 }).catch(() => {});
+        await page.waitForTimeout(800);
+        break; // assume it worked
+      }
+    } catch {}
+  }
+
+  // If no links yet, use the My Day menu → Assignment Center path once
   let haveLinks = false;
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 8; i++) {
     const c = await page.locator(LIST_LINK_SELECTOR).count().catch(() => 0);
     if (c > 0) { haveLinks = true; break; }
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(500);
   }
   if (!haveLinks) {
-    const myDay = page.getByRole('button', { name: /^my day$/i }).or(page.getByRole('link', { name: /^my day$/i }));
+    const myDay = page.getByRole('button', { name: /^my day$/i })
+                      .or(page.getByRole('link', { name: /^my day$/i }));
     if (await myDay.count()) await myDay.first().click().catch(() => {});
     const ac = page.getByRole('menuitem', { name: /assignment center/i })
                    .or(page.getByRole('link', { name: /assignment center/i }))
@@ -219,6 +242,12 @@ async function openAssignmentCenter(page) {
     if (await ac.count()) await ac.first().click().catch(() => {});
     await page.waitForTimeout(1200);
   }
+
+  // Wait for the main container to exist (best-effort)
+  const containerSel = LINK_CONTAINER_SELECTOR || 'main, [role="main"], #content';
+  await page.waitForSelector(containerSel, { timeout: 60000 }).catch(() => {});
+}
+
 
   // Wait for container + poll for links
   await page.waitForSelector(LINK_CONTAINER_SELECTOR, { timeout: 60000 }).catch(() => {});
@@ -248,11 +277,43 @@ async function scrapeAssignments() {
     await loginBlackbaud(page);
     await openAssignmentCenter(page);
 
-    // Collect links on the list page
-    const links = await page.$$eval(LIST_LINK_SELECTOR, as =>
-      as.map(a => ({ href: a.href, text: a.textContent?.trim() || "" }))
-    );
-    const unique = links.filter((v, i, arr) => arr.findIndex(x => x.href === v.href) === i);
+// Collect links on the page (try precise selector, then broaden if needed)
+let links = await page.$$eval(LIST_LINK_SELECTOR, as =>
+  as.map(a => ({ href: a.href, text: a.textContent?.trim() || "" }))
+).catch(() => []);
+
+if (!links || links.length === 0) {
+  // Calendar cards & alt tenants sometimes put the anchor inside various wrappers
+  const BROAD1 =
+    'a[href*="/lms-assignment/assignment/assignment-student-view/"],' +
+    'a[href*="/lms-assignment/assignment/"],' +
+    'a[href*="/assignment-student-view/"],' +
+    '[data-automation-id*="assignment"] a,' +
+    '.fsAssignment a';
+
+  links = await page.$$eval(BROAD1, as =>
+    as.map(a => ({ href: a.href, text: a.textContent?.trim() || "" }))
+  ).catch(() => []);
+}
+
+if (!links || links.length === 0) {
+  // Nuclear fallback: any anchor that contains "assignment"
+  const BROAD2 = 'a[href*="assignment"], a[data-url*="assignment"]';
+  links = await page.$$eval(BROAD2, as =>
+    as.map(a => ({ href: a.href, text: a.textContent?.trim() || "" }))
+  ).catch(() => []);
+}
+
+const unique = (links || []).filter((v, i, arr) =>
+  v.href && arr.findIndex(x => x.href === v.href) === i
+);
+
+if (unique.length === 0) {
+  // Provide a clearer error with the current URL for troubleshooting
+  throw new Error(`No assignments found after navigating to Assignment Center. url=${page.url()}`);
+}
+
+
 
     const assignments = [];
     for (const { href } of unique) {
