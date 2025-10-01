@@ -113,10 +113,33 @@ app.post("/scrape", async (req, res) => {
     }
 
     // -------- Assignment list --------
-    await page.goto(ASSIGN_URL, { waitUntil: "networkidle", timeout: 60000 });
-    await page.waitForTimeout(1200); // give SPA time to render
+    // Navigate to the Assignments page (hash route => don't wait for networkidle)
+await page.goto(ASSIGN_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
 
-    const listLinks = page.locator(LIST_LINK_SELECTOR);
+// Give the SPA time to render and then poll for assignment links
+let listLinks, found = false;
+for (let i = 0; i < 20; i++) {               // up to ~20s total
+  await page.waitForTimeout(1000);
+  listLinks = page.locator(LIST_LINK_SELECTOR);
+  const c = await listLinks.count().catch(() => 0);
+  if (c > 0) { found = true; break; }
+}
+
+// If still nothing, try a soft reload of the hash route once
+if (!found) {
+  await page.evaluate(url => { window.location.href = url; }, ASSIGN_URL);
+  for (let i = 0; i < 20; i++) {
+    await page.waitForTimeout(1000);
+    listLinks = page.locator(LIST_LINK_SELECTOR);
+    const c = await listLinks.count().catch(() => 0);
+    if (c > 0) { found = true; break; }
+  }
+}
+
+if (!found) {
+  throw new Error("Could not find any assignments on the page (LIST_LINK_SELECTOR matched 0 elements).");
+}
+
     const listCount = await listLinks.count();
     const drive = driveClientOrNull();
     const assignments = [];
