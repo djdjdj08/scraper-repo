@@ -278,9 +278,55 @@ async function scrapeAssignments() {
     await openAssignmentCenter(page);
 
 // Collect links on the page (try precise selector, then broaden if needed)
-let links = await page.$$eval(LIST_LINK_SELECTOR, as =>
-  as.map(a => ({ href: a.href, text: a.textContent?.trim() || "" }))
-).catch(() => []);
+let links = [];
+try {
+  links = await page.$$eval(LIST_LINK_SELECTOR, (as) =>
+    as.map((a) => ({ href: a.href, text: (a.textContent || "").trim() }))
+  );
+} catch {
+  links = [];
+}
+
+if (!links || links.length === 0) {
+  // Calendar cards & alt tenants sometimes put anchors in different wrappers
+  const BROAD1 =
+    'a[href*="/lms-assignment/assignment/assignment-student-view/"],' +
+    'a[href*="/lms-assignment/assignment/"],' +
+    'a[href*="/assignment-student-view/"],' +
+    '[data-automation-id*="assignment"] a,' +
+    '.fsAssignment a';
+
+  try {
+    links = await page.$$eval(BROAD1, (as) =>
+      as.map((a) => ({ href: a.href, text: (a.textContent || "").trim() }))
+    );
+  } catch {
+    links = [];
+  }
+}
+
+if (!links || links.length === 0) {
+  // Nuclear fallback: any anchor that contains "assignment"
+  const BROAD2 = 'a[href*="assignment"], a[data-url*="assignment"]';
+  try {
+    links = await page.$$eval(BROAD2, (as) =>
+      as.map((a) => ({ href: a.href, text: (a.textContent || "").trim() }))
+    );
+  } catch {
+    links = [];
+  }
+}
+
+const unique = (links || []).filter(
+  (v, i, arr) => v.href && arr.findIndex((x) => x.href === v.href) === i
+);
+
+if (unique.length === 0) {
+  throw new Error(
+    `No assignments found after navigating to Assignment Center. url=${page.url()}`
+  );
+}
+
 
 if (!links || links.length === 0) {
   // Calendar cards & alt tenants sometimes put the anchor inside various wrappers
