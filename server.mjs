@@ -17,7 +17,7 @@ const BB_BASE     = (process.env.BB_BASE || "").trim().replace(/\/+$/, ""); // n
 const LOGIN_URL  = process.env.BB_LOGIN_URL  || `${BB_BASE}/app/login`;
 const ASSIGN_URL = process.env.BB_ASSIGN_URL || `${BB_BASE}/app/student#assignment-center`;
 
-// Selectors (override via env if your DOM differs)
+// Selectors (can override via env if DOM differs)
 const LIST_LINK_SELECTOR     = process.env.LIST_LINK_SELECTOR     || 'a[href*="Assignment"], a[href*="assignment"]';
 const DETAIL_TITLE_SELECTOR  = process.env.DETAIL_TITLE_SELECTOR  || "h1, .assignment-title, .detail-title";
 const DETAIL_COURSE_SELECTOR = process.env.DETAIL_COURSE_SELECTOR || ".assignment-course, .detail-course";
@@ -26,8 +26,8 @@ const DETAIL_DESC_SELECTOR   = process.env.DETAIL_DESC_SELECTOR   || ".assignmen
 const DETAIL_RES_AREA_SEL    = process.env.DETAIL_RES_AREA_SEL    || ".assignment-resources, .detail-resources";
 const DETAIL_RES_ANCH_SEL    = process.env.DETAIL_RES_ANCH_SEL    || `${DETAIL_RES_AREA_SEL} a, a.resource-link`;
 
-// Google Drive (optional – enables public links for attachments)
-const SA_JSON         = process.env.GOOGLE_SERVICE_ACCOUNT_JSON; // paste full JSON in Render env
+// Google Drive (optional – for public attachment links)
+const SA_JSON         = process.env.GOOGLE_SERVICE_ACCOUNT_JSON; // full JSON
 const GDRIVE_FOLDERID = process.env.GDRIVE_FOLDER_ID || null;
 
 /* --------------------------- HELPERS (Drive) -------------------------- */
@@ -124,7 +124,7 @@ app.post("/scrape", async (req, res) => {
     for (let i = 0; i < listCount; i++) {
       const link = listLinks.nth(i);
 
-      // Open in a new tab so we keep the list page intact
+      // Open in a new tab so the list page stays intact
       const [detailPage] = await Promise.all([
         context.waitForEvent("page"),
         link.click()
@@ -165,7 +165,7 @@ app.post("/scrape", async (req, res) => {
             const uploaded = await uploadBufferToDrive(drive, suggested, buf);
             resources.push({ name: uploaded.name, href: uploaded.href, mimeType: uploaded.mimeType });
           } else {
-            // Not a real file download (or Drive not configured) -> just keep href
+            // Not a file download (or Drive not configured) -> just keep href
             const href = await a.getAttribute("href");
             if (href) resources.push({ name: linkText, href, mimeType: "text/html" });
           }
