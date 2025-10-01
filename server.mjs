@@ -4,7 +4,7 @@ import { chromium } from "playwright";
 import { google } from "googleapis";
 
 /* ===================== ENV ===================== */
-const SECRET      = process.env.WEBHOOK_SECRET || "change-me";
+const SECRET      = (process.env.WEBHOOK_SECRET || "HOMEWORKNEVEREVER").trim();
 const BB_BASE     = (process.env.BB_BASE || "").replace(/\/+$/, "");
 const BB_USERNAME = process.env.BB_USERNAME || "";
 const BB_PASSWORD = process.env.BB_PASSWORD || "";
@@ -319,9 +319,12 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/", (_req, res) => res.send("OK"));
 
 app.post("/scrape", async (req, res) => {
-  if (req.header("X-Webhook-Secret") !== SECRET) {
+  // Be forgiving of casing/whitespace
+  const provided = (req.get("X-Webhook-Secret") || req.get("x-webhook-secret") || "").trim();
+  if (provided !== SECRET) {
     return res.status(401).json({ error: "unauthorized" });
   }
+
   try {
     const data = await scrapeAssignments();
     res.json(data);
