@@ -4,7 +4,6 @@
   "type": "module",
   "engines": { "node": "20.x" },
   "scripts": {
-    "postinstall": "npx playwright install --with-deps chromium",
     "start": "node server.mjs"
   },
   "dependencies": {
