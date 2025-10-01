@@ -327,107 +327,74 @@ if (!links || links.length === 0) {
   }
 }
 
-const unique = (links || []).filter(
+const uniqueLinks = (links || []).filter(
   (v, i, arr) => v.href && arr.findIndex((x) => x.href === v.href) === i
 );
 
-if (unique.length === 0) {
+if (uniqueLinks.length === 0) {
   throw new Error(
     `No assignments found after navigating to Assignment Center. url=${page.url()}`
   );
 }
 
+// ---- use uniqueLinks for the detail loop ----
+const assignments = [];
+for (const { href } of uniqueLinks) {
+  const detail = await context.newPage();
+  try {
+    await detail.goto(href, { waitUntil: "domcontentloaded", timeout: 120000 });
+    await detail.waitForTimeout(500);
 
-if (!links || links.length === 0) {
-  // Calendar cards & alt tenants sometimes put the anchor inside various wrappers
-  const BROAD1 =
-    'a[href*="/lms-assignment/assignment/assignment-student-view/"],' +
-    'a[href*="/lms-assignment/assignment/"],' +
-    'a[href*="/assignment-student-view/"],' +
-    '[data-automation-id*="assignment"] a,' +
-    '.fsAssignment a';
-
-  links = await page.$$eval(BROAD1, as =>
-    as.map(a => ({ href: a.href, text: a.textContent?.trim() || "" }))
-  ).catch(() => []);
-}
-
-if (!links || links.length === 0) {
-  // Nuclear fallback: any anchor that contains "assignment"
-  const BROAD2 = 'a[href*="assignment"], a[data-url*="assignment"]';
-  links = await page.$$eval(BROAD2, as =>
-    as.map(a => ({ href: a.href, text: a.textContent?.trim() || "" }))
-  ).catch(() => []);
-}
-
-const unique = (links || []).filter((v, i, arr) =>
-  v.href && arr.findIndex(x => x.href === v.href) === i
-);
-
-if (unique.length === 0) {
-  // Provide a clearer error with the current URL for troubleshooting
-  throw new Error(`No assignments found after navigating to Assignment Center. url=${page.url()}`);
-}
-
-
-
-    const assignments = [];
-    for (const { href } of unique) {
-      const detail = await context.newPage();
+    const getText = async (sel) => {
       try {
-        await detail.goto(href, { waitUntil: "domcontentloaded", timeout: 120000 });
-        await detail.waitForTimeout(500);
+        return ((await detail.locator(sel).first().textContent()) || "").trim();
+      } catch {
+        return "";
+      }
+    };
 
-        const getText = async (sel) => {
-          try { return ((await detail.locator(sel).first().textContent()) || "").trim(); }
-          catch { return ""; }
-        };
+    const title       = await getText(DETAIL_TITLE_SELECTOR);
+    const course      = await getText(DETAIL_COURSE_SELECTOR);
+    const due         = await getText(DETAIL_DUE_SELECTOR);
+    const description = await getText(DETAIL_DESC_SELECTOR);
 
-        const title       = await getText(DETAIL_TITLE_SELECTOR);
-        const course      = await getText(DETAIL_COURSE_SELECTOR);
-        const due         = await getText(DETAIL_DUE_SELECTOR);
-        const description = await getText(DETAIL_DESC_SELECTOR);
+    // Resources
+    const resLoc = detail.locator(DETAIL_RES_ANCH_SEL);
+    const rCount = await resLoc.count().catch(() => 0);
+    const resources = [];
 
-        // Resources
-        const resLoc = detail.locator(DETAIL_RES_ANCH_SEL);
-        const rCount = await resLoc.count().catch(() => 0);
-        const resources = [];
+    for (let i = 0; i < rCount; i++) {
+      const a = resLoc.nth(i);
+      const label = ((await a.textContent().catch(() => "")) || "resource").trim();
 
-        for (let i = 0; i < rCount; i++) {
-          const a = resLoc.nth(i);
-          const label = ((await a.textContent().catch(() => "")) || "resource").trim();
+      // Try download; otherwise capture the href
+      const [dl] = await Promise.all([
+        detail.waitForEvent("download").catch(() => null),
+        a.click().catch(() => null),
+      ]);
 
-          // Try to trigger a download; if no download, capture the href
-          const [dl] = await Promise.all([
-            detail.waitForEvent("download").catch(() => null),
-            a.click().catch(() => null)
-          ]);
-
-          if (dl && drive) {
-            const suggested = (await dl.suggestedFilename().catch(() => label)) || label;
-            const rs = await dl.createReadStream();
-            const buf = await streamToBuffer(rs);
-            const uploaded = await uploadBufferToDrive(drive, suggested, buf);
-            resources.push({ name: uploaded.name, href: uploaded.href, mimeType: uploaded.mimeType });
-          } else {
-            const href = await a.getAttribute("href");
-            if (href) resources.push({ name: label, href, mimeType: "text/html" });
-          }
-        }
-
-        assignments.push({ title, course, due, description, resources, url: href });
-      } finally {
-        await detail.close().catch(() => {});
+      if (dl && drive) {
+        const suggested = (await dl.suggestedFilename().catch(() => label)) || label;
+        const rs = await dl.createReadStream();
+        const buf = await streamToBuffer(rs);
+        const uploaded = await uploadBufferToDrive(drive, suggested, buf);
+        resources.push({
+          name: uploaded.name,
+          href: uploaded.href,
+          mimeType: uploaded.mimeType,
+        });
+      } else {
+        const href2 = await a.getAttribute("href");
+        if (href2) resources.push({ name: label, href: href2, mimeType: "text/html" });
       }
     }
 
-    await browser.close().catch(() => {});
-    return { scrapedAt: new Date().toISOString(), assignments };
-  } catch (e) {
-    await browser.close().catch(() => {});
-    throw e;
+    assignments.push({ title, course, due, description, resources, url: href });
+  } finally {
+    await detail.close().catch(() => {});
   }
 }
+
 
 /* ===================== HTTP SERVER ===================== */
 const app = express();
